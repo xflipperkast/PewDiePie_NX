@@ -18,12 +18,9 @@ An unofficial Nintendo Switch port of the Android version of
 
 ---
 
-## About
+## About PewDiePie: Legend of the Brofist — Nintendo Switch
 
-# PewDiePie: Legend of the Brofist — Nintendo Switch
-
-Isolated ARM64 Android compatibility port for **PewDiePie 1.4.6**, maintained by
-xFlippy. The source and NRO run independently of APK64 and the Earn to Die port.
+Isolated Android compatibility port for **PewDiePie 1.4.6**,
 The original APK is required and is not bundled in distributable archives.
 
 ## Install
