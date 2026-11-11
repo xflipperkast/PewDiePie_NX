@@ -47,11 +47,6 @@ Existing APK64 saves remain in their original location.
   reserved for the cursor while shown; other gamepad buttons remain available.
 * **Plus**: exit.
 
-Logging, crash-file output and the sampling profiler are disabled at compile
-time. There is no log/config folder, installation launcher or external APK64
-dependency. Startup failures show the first failed check on screen; press B to
-return. This does not create log files or capture gameplay crashes.
-
 ## Build and verify
 
 Requires devkitPro devkitA64/libnx and Switch portlibs (Mesa/nouveau, FreeType,
