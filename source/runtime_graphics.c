@@ -2246,6 +2246,7 @@ uint32_t pdp_eglSwapBuffers(void *d, void *s) {
                         (unsigned long long)graphics_g_pdp_present_count,
                         (unsigned long long)(span / 1000u),
                         (unsigned long long)(window_max_gap_us / 1000u));
+            pdp_jni_log_memory_state(graphics_g_pdp_present_count);
             window_begin_us = now_us;
             window_presents = 0;
             window_max_gap_us = 0;

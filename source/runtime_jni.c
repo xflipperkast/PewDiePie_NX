@@ -329,6 +329,7 @@ typedef struct jni_PdpJniFieldCell {
 } jni_PdpJniFieldCell;
 
 struct jni_PdpJniObject {
+    unsigned global_refs;
     jni_PdpJniObjectKind kind;
     jni_PdpJniClass *clazz;
     void *host_data;
@@ -435,6 +436,7 @@ struct jni_PdpJniEnvState {
     pthread_t thread;
     jni_PdpJniObject *pending_exception;
     jni_PdpJniRef *locals;
+    jni_PdpJniRef *free_locals;
     unsigned frame_depth;
     unsigned application_loader_depth;
     bool daemon;
@@ -455,6 +457,7 @@ static jni_PdpJniVmHandle jni_g_vm_handle;
 static jni_PdpJniClass *jni_g_classes;
 static jni_PdpJniObject *jni_g_objects;
 static jni_PdpJniRef *jni_g_refs;
+static jni_PdpJniRef *jni_g_free_local_refs;
 static size_t jni_g_class_count;
 static size_t jni_g_method_count;
 /* Bumped whenever a method is declared or a class hierarchy changes, which
@@ -538,8 +541,24 @@ static bool jni_ptr_set_insert_locked(jni_PtrSet *set, uintptr_t key) {
     jni_PtrSetTable *table = set->table;
     if (!table || (set->count + 1u) * 2u > table->cap) {
         const size_t cap = table ? table->cap * 2u : 4096u;
-        jni_PtrSetTable *grown = calloc(1, sizeof(*grown) + cap * sizeof(grown->slots[0]));
-        if (!grown) return false;
+        const size_t bytes = sizeof(*table) + cap * sizeof(table->slots[0]);
+        const char *index = set == &jni_g_ref_set ? "refs" : "objects";
+        const bool trace = pdp_diag_logging_enabled && bytes >= 1024u * 1024u;
+        const int prior_errno = errno;
+        const uint64_t start_us = trace ? pdp_perf_now_us() : 0;
+        if (trace) {
+            PDP_LOGCI("MEMORY", "JNI index grow phase=begin index=%s slots=%zu bytes=%zu timeUs=%" PRIu64 " pthread=%p",
+                      index, cap, bytes, start_us, (void *)(uintptr_t)pthread_self());
+            errno = prior_errno;
+        }
+        jni_PtrSetTable *grown = calloc(1, bytes);
+        if (!grown) {
+            const int saved = errno;
+            PDP_LOGCW("MEMORY", "JNI index grow phase=end outcome=failed index=%s slots=%zu bytes=%zu errno=%d timeUs=%" PRIu64 " pthread=%p",
+                      index, cap, bytes, saved, pdp_perf_now_us(), (void *)(uintptr_t)pthread_self());
+            errno = saved;
+            return false;
+        }
         grown->cap = cap;
         grown->retired = table;
         for (size_t i = 0; table && i < table->cap; ++i) {
@@ -550,6 +569,12 @@ static bool jni_ptr_set_insert_locked(jni_PtrSet *set, uintptr_t key) {
         }
         __atomic_store_n(&set->table, grown, __ATOMIC_RELEASE);
         table = grown;
+        if (trace) {
+            const int saved = errno;
+            PDP_LOGCI("MEMORY", "JNI index grow phase=end outcome=ok index=%s slots=%zu elapsedUs=%" PRIu64 " pthread=%p",
+                      index, cap, pdp_perf_now_us() - start_us, (void *)(uintptr_t)pthread_self());
+            errno = saved;
+        }
     }
     size_t s = jni_ptr_set_slot(key, table->cap);
     while (table->slots[s]) {
@@ -583,6 +608,18 @@ static void jni_ptr_set_reset_locked(jni_PtrSet *set) {
         table = older;
     }
     set->count = 0;
+}
+
+void pdp_jni_log_memory_state(uint64_t presents) {
+    if (!pdp_diag_logging_enabled) return;
+    const int saved = errno;
+    const uint64_t now_us = pdp_perf_now_us();
+    PDP_PERF_LOCK(&jni_g_lock);
+    const size_t refs = jni_g_ref_set.count, objects = jni_g_object_set.count;
+    pthread_mutex_unlock(&jni_g_lock);
+    PDP_LOGCI("MEMORY", "JNI registry presents=%" PRIu64 " timeUs=%" PRIu64 " pthread=%p refCells=%zu refCellBytes=%zu objectKeys=%zu",
+              presents, now_us, (void *)(uintptr_t)pthread_self(), refs, refs * sizeof(jni_PdpJniRef), objects);
+    errno = saved;
 }
 
 static bool jni_ref_set_insert_locked(const jni_PdpJniRef *ref) {
@@ -651,15 +688,16 @@ static jni_PdpJniRef *jni_as_ref(void *value) {
         return NULL;
     }
     if (!__atomic_load_n(&ref->alive, __ATOMIC_ACQUIRE)) return NULL;
+    /* Validate local ownership before reading the referent. A recycled cell
+     * can be reassigned after its previous owner detaches. */
+    if (ref->kind == PDP_JNI_REF_LOCAL &&
+        __atomic_load_n(&ref->owner, __ATOMIC_RELAXED) !=
+            jni_env_state_unchecked(pdp_jni_current_env()))
+        return NULL;
     if (!jni_ptr_set_contains(&jni_g_object_set, (uintptr_t)ref->object)) {
         report_invalid_ref(value, true, __builtin_return_address(0));
         return NULL;
     }
-    /* Local references belong to the creating JNI thread. Global and weak
-     * globals are process-wide and may cross threads. */
-    if (ref->kind == PDP_JNI_REF_LOCAL &&
-        (!ref->owner || !pthread_equal(ref->owner->thread, pthread_self())))
-        return NULL;
     return ref;
 }
 
@@ -791,16 +829,24 @@ static jni_PdpJniObject *jni_alloc_object_locked(jni_PdpJniObjectKind kind, jni_
 static jni_PdpJniRef *jni_new_ref_locked(jni_PdpJniEnvState *env, jni_PdpJniObject *object,
                                     jni_PdpJniRefKind kind) {
     if (!object) return NULL;
-    jni_PdpJniRef *ref = calloc(1, sizeof(*ref));
-    if (!ref) return NULL;
-    if (!jni_ref_set_insert_locked(ref)) { free(ref); return NULL; }
+    jni_PdpJniRef *ref = NULL;
+    if (kind == PDP_JNI_REF_LOCAL && env) {
+        jni_PdpJniRef **free_list = env->free_locals ? &env->free_locals : &jni_g_free_local_refs;
+        ref = *free_list;
+        if (ref) *free_list = ref->next_env;
+    }
+    if (!ref) {
+        ref = calloc(1, sizeof(*ref));
+        if (!ref) return NULL;
+        ref->kind = kind;
+        if (!jni_ref_set_insert_locked(ref)) { free(ref); return NULL; }
+        ref->next_all = jni_g_refs;
+        jni_g_refs = ref;
+    }
     ref->object = object;
-    ref->kind = kind;
-    ref->owner = kind == PDP_JNI_REF_LOCAL ? env : NULL;
+    if (kind == PDP_JNI_REF_GLOBAL) __atomic_fetch_add(&object->global_refs, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(&ref->owner, kind == PDP_JNI_REF_LOCAL ? env : NULL, __ATOMIC_RELAXED);
     ref->frame_depth = env ? env->frame_depth : 0;
-    ref->alive = true;
-    ref->next_all = jni_g_refs;
-    jni_g_refs = ref;
     if (kind == PDP_JNI_REF_LOCAL && env) {
         ref->prev_env = NULL;
         ref->next_env = env->locals;
@@ -808,6 +854,7 @@ static jni_PdpJniRef *jni_new_ref_locked(jni_PdpJniEnvState *env, jni_PdpJniObje
         env->locals = ref;
         ref->in_env_list = true;
     }
+    __atomic_store_n(&ref->alive, true, __ATOMIC_RELEASE);
     return ref;
 }
 
@@ -820,6 +867,14 @@ static void jni_env_locals_unlink(jni_PdpJniEnvState *env, jni_PdpJniRef *ref) {
     ref->in_env_list = false;
 }
 
+static void jni_release_local(jni_PdpJniEnvState *env, jni_PdpJniRef *ref) {
+    __atomic_store_n(&ref->alive, false, __ATOMIC_RELEASE);
+    jni_env_locals_unlink(env, ref);
+    /* JNI local handles expire on delete, frame pop, or detach. */
+    ref->next_env = env->free_locals;
+    env->free_locals = ref;
+}
+
 /* Local references are created at the current frame depth and the list is
  * newest first, so every reference of the frames being popped sits at the
  * head: the walk stops at the first older reference instead of visiting the
@@ -829,8 +884,7 @@ static void jni_invalidate_env_locals_locked(jni_PdpJniEnvState *env, unsigned m
     jni_PdpJniRef *ref = env->locals;
     while (ref && ref->frame_depth >= min_depth) {
         jni_PdpJniRef *next = ref->next_env;
-        __atomic_store_n(&ref->alive, false, __ATOMIC_RELEASE);
-        jni_env_locals_unlink(env, ref);
+        jni_release_local(env, ref);
         ref = next;
     }
 }
@@ -1124,6 +1178,12 @@ static void jni_env_destroy(jni_PdpJniEnvState *env) {
     if (!env) return;
     PDP_PERF_LOCK(&jni_g_lock);
     jni_invalidate_env_locals_locked(env, 0);
+    while (env->free_locals) {
+        jni_PdpJniRef *ref = env->free_locals;
+        env->free_locals = ref->next_env;
+        ref->next_env = jni_g_free_local_refs;
+        jni_g_free_local_refs = ref;
+    }
     pthread_mutex_unlock(&jni_g_lock);
     free(env->attach_name);
     free(env);
@@ -1678,8 +1738,14 @@ static void *jni_jni_new_global_ref(jni_PdpJNIEnv *env_handle, void *object_ref)
 static void jni_jni_delete_global_ref(jni_PdpJNIEnv *env_handle, void *ref_value) {
     (void)env_handle;
     jni_PdpJniRef *ref = jni_as_ref(ref_value);
-    if (ref && ref->kind == PDP_JNI_REF_GLOBAL)
-        __atomic_store_n(&ref->alive, false, __ATOMIC_RELEASE);
+    if (ref && ref->kind == PDP_JNI_REF_GLOBAL &&
+        __atomic_exchange_n(&ref->alive, false, __ATOMIC_ACQ_REL))
+        __atomic_fetch_sub(&ref->object->global_refs, 1u, __ATOMIC_RELEASE);
+}
+
+unsigned pdp_jni_global_ref_count_host(void *value) {
+    jni_PdpJniObject *object = jni_object_from_ref(value);
+    return object ? __atomic_load_n(&object->global_refs, __ATOMIC_ACQUIRE) : 0;
 }
 
 static void *jni_jni_new_weak_global_ref(jni_PdpJNIEnv *env_handle, void *object_ref) {
@@ -1702,10 +1768,9 @@ static void jni_jni_delete_weak_global_ref(jni_PdpJNIEnv *env_handle, void *ref_
 static void jni_jni_delete_local_ref(jni_PdpJNIEnv *env_handle, void *ref_value) {
     jni_PdpJniEnvState *env = jni_env_state(env_handle);
     jni_PdpJniRef *ref = jni_as_ref(ref_value);
-    if (env && ref && ref->kind == PDP_JNI_REF_LOCAL && ref->owner == env) {
-        __atomic_store_n(&ref->alive, false, __ATOMIC_RELEASE);
-        jni_env_locals_unlink(env, ref);
-    }
+    if (env && ref && ref->kind == PDP_JNI_REF_LOCAL &&
+        __atomic_load_n(&ref->owner, __ATOMIC_RELAXED) == env)
+        jni_release_local(env, ref);
 }
 
 static uint8_t jni_jni_is_same_object(jni_PdpJNIEnv *env_handle, void *a, void *b) {
@@ -4794,6 +4859,7 @@ static void jni_free_model(void) {
     jni_PdpJniRef *ref = jni_g_refs;
     while (ref) { jni_PdpJniRef *next = ref->next_all; free(ref); ref = next; }
     jni_g_refs = NULL;
+    jni_g_free_local_refs = NULL;
     jni_ptr_set_reset_locked(&jni_g_ref_set);
     jni_ptr_set_reset_locked(&jni_g_object_set);
 
@@ -5410,7 +5476,8 @@ bool pdp_jni_ref_values_identity(uint64_t a, uint64_t b, bool *out_same) {
         /* Reference equality is identity of the referent (JLS 15.21.3). A
          * deleted/out-of-scope ref no longer names an object, so it is only
          * equal to itself. */
-        *out_same = a == b || (ra->alive && rb->alive && ra->object == rb->object);
+        *out_same = a == b || (__atomic_load_n(&ra->alive, __ATOMIC_ACQUIRE) &&
+                              __atomic_load_n(&rb->alive, __ATOMIC_ACQUIRE) && ra->object == rb->object);
     }
     pthread_mutex_unlock(&jni_g_lock);
     return refs;

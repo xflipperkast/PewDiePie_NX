@@ -391,7 +391,7 @@ static void *dex_vm_dex_prof_main(void *arg) {
 }
 
 static void dex_vm_dex_prof_start(void) {
-#ifdef PDP_DISABLE_LOGGING
+#if defined(PDP_DISABLE_LOGGING) || defined(PDP_DISABLE_PROFILER)
     return;
 #endif
     pthread_attr_t attr;
@@ -4749,6 +4749,8 @@ static PdpResult dex_vm_execute_image(dex_vm_DexExecCtx *ctx, PdpDexMethodImage 
             (void)pdp_jni_throw_new_by_name(ctx->env, "java/lang/StackOverflowError", detail);
         return PDP_ERR_APK_UNSUPPORTED;
     }
+    const bool local_frame = ctx && ctx->env && pdp_jni_push_local_frame_host(ctx->env, 16) == PDP_OK;
+    if (ctx && ctx->env && !local_frame) return PDP_ERR_NO_MEMORY;
     const PdpDexMethodImage *saved = ctx ? ctx->current : NULL;
     const bool stack_pushed = m && dex_vm_g_dex_stack_depth < DEX_STACK_SNAPSHOT_MAX;
     if (stack_pushed) dex_vm_g_dex_stack[dex_vm_g_dex_stack_depth++] = m;
@@ -4762,7 +4764,16 @@ static PdpResult dex_vm_execute_image(dex_vm_DexExecCtx *ctx, PdpDexMethodImage 
         prof_host = dex_vm_dex_prof_host_enter(NULL, NULL);
     }
     if (ctx) ctx->current = m;
-    const PdpResult rc = dex_vm_execute_image_body(ctx, m, incoming_words, incoming_count, depth, out_result);
+    PdpResult rc = dex_vm_execute_image_body(ctx, m, incoming_words, incoming_count, depth, out_result);
+    if (local_frame) {
+        const char *ret = m && rc == PDP_OK ? strchr(m->signature, ')') : NULL;
+        const bool object_result = ret && (ret[1] == 'L' || ret[1] == '[') && out_result;
+        void *result = pdp_jni_pop_local_frame_host(ctx->env, object_result ? out_result->l : NULL);
+        if (object_result) {
+            if (out_result->l && !result) rc = PDP_ERR_NO_MEMORY;
+            out_result->l = result;
+        }
+    }
     if (ctx) ctx->current = saved;
     if (prof) {
         atomic_store_explicit(&prof->innermost, prof_saved, memory_order_release);

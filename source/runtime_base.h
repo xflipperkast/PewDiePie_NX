@@ -951,6 +951,7 @@ typedef PdpResult (*PdpJniMethodResolver)(const char *class_name,
  * by pdp_jni_init so JNI_OnLoad can immediately call GetEnv. */
 PdpResult pdp_jni_init(void);
 void pdp_jni_reset(void);
+void pdp_jni_log_memory_state(uint64_t presents);
 
 /* This is the exact pointer value that should be passed as JavaVM* to a guest
  * JNI_OnLoad or another JNI-aware entry point. */
@@ -2385,6 +2386,8 @@ void pdp_dex_log_unresolved_summary(void);
 #include <stdarg.h>
 
 bool pdp_diag_init(const char *log_path);
+unsigned pdp_jni_global_ref_count_host(void *value);
+extern bool pdp_diag_logging_enabled;
 void pdp_diag_set_stdout(bool enabled);
 void pdp_diag_set_quiet(bool enabled);
 void pdp_diag_set_full_trace(bool enabled);
@@ -2409,14 +2412,14 @@ void pdp_log_category(const char *category, const char *level, const char *fmt, 
 #define PDP_LOGCW(...) ((void)0)
 #define PDP_LOGCE(...) ((void)0)
 #else
-#define PDP_LOGI(...) pdp_log("INFO", __VA_ARGS__)
-#define PDP_LOGW(...) pdp_log("WARN", __VA_ARGS__)
-#define PDP_LOGE(...) pdp_log("ERROR", __VA_ARGS__)
-#define PDP_LOGT(...) pdp_log("TEST", __VA_ARGS__)
+#define PDP_LOGI(...) do { if (pdp_diag_logging_enabled) pdp_log("INFO", __VA_ARGS__); } while (0)
+#define PDP_LOGW(...) do { if (pdp_diag_logging_enabled) pdp_log("WARN", __VA_ARGS__); } while (0)
+#define PDP_LOGE(...) do { if (pdp_diag_logging_enabled) pdp_log("ERROR", __VA_ARGS__); } while (0)
+#define PDP_LOGT(...) do { if (pdp_diag_logging_enabled) pdp_log("TEST", __VA_ARGS__); } while (0)
 
-#define PDP_LOGCI(category, ...) pdp_log_category((category), "INFO", __VA_ARGS__)
-#define PDP_LOGCW(category, ...) pdp_log_category((category), "WARN", __VA_ARGS__)
-#define PDP_LOGCE(category, ...) pdp_log_category((category), "ERROR", __VA_ARGS__)
+#define PDP_LOGCI(category, ...) do { if (pdp_diag_logging_enabled) pdp_log_category((category), "INFO", __VA_ARGS__); } while (0)
+#define PDP_LOGCW(category, ...) do { if (pdp_diag_logging_enabled) pdp_log_category((category), "WARN", __VA_ARGS__); } while (0)
+#define PDP_LOGCE(category, ...) do { if (pdp_diag_logging_enabled) pdp_log_category((category), "ERROR", __VA_ARGS__); } while (0)
 #endif
 
 
@@ -4603,7 +4606,8 @@ bool pdp_mp3_decoder_decode_into(PdpMp3Decoder *decoder, PdpStereoRing *ring,
 #define NX_GAME_APK NX_ROOT "/pewdiepie.apk"
 #define NX_SAVES NX_ROOT "/data"
 #define NX_RUNTIME_APPS NX_ROOT "/data/runtime"
-#define NX_LOG NULL
+#define NX_LOG NX_ROOT "/graphics.log"
+#define NX_LOG_FLAG NX_ROOT "/log.flag"
 #define NX_PACKAGE "com.outerminds.pewdiepie"
 
 /* Host mount policy, independent of Android package identity. */

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE 1
 #include "runtime.h"
 
+bool pdp_diag_logging_enabled = false;
 
 /* ---- log ---- */
 #pragma push_macro("PDP_LOG_FLUSH_INTERVAL_NS")
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <switch.h>
+
 
 /* Logging never performs I/O on the calling thread. A line is copied into a
  * ring buffer under a short lock; a writer thread moves it to the log file,
@@ -93,6 +95,7 @@ void pdp_diag_emergency_write(const char *text) {
     (void)text;
     return;
 #endif
+    if (!pdp_diag_logging_enabled) return;
     static char chunk[16 * 1024];
     bool output = false, ring = false;
     for (int i = 0; i < 100 && !(output = pthread_mutex_trylock(&log_g_output_lock) == 0); ++i) svcSleepThread(2000000);
@@ -216,6 +219,7 @@ void pdp_diag_shutdown(void) {
         log_g_log_file = NULL;
     }
     pthread_mutex_unlock(&log_g_output_lock);
+    pdp_diag_logging_enabled = false;
 }
 
 static void log_emit_line(const char *line, bool force_flush) {
@@ -250,6 +254,7 @@ void pdp_vlog(const char *level, const char *fmt, va_list args) {
     (void)level; (void)fmt; (void)args;
     return;
 #endif
+    if (!pdp_diag_logging_enabled) return;
     char message[1024];
     char line[1152];
 
@@ -322,6 +327,7 @@ void pdp_log_category(const char *category, const char *level, const char *fmt, 
     (void)category; (void)level; (void)fmt;
     return;
 #endif
+    if (!pdp_diag_logging_enabled) return;
     char message[960];
     char line[1152];
     va_list args;

@@ -29724,6 +29724,8 @@ enum { KEY_ACTION_DOWN = 0, KEY_ACTION_UP = 1 };
 
 typedef struct framework_KeyEventPayload {
     uint64_t magic;
+    unsigned diagnostic_reads[2];
+    pthread_t diagnostic_owner;
     void *object_global;
     int32_t action;
     int32_t key_code;
@@ -29783,8 +29785,12 @@ static void *framework_key_event_obtain(void *env, framework_KeyEventPayload **o
     if (!out) return NULL;
     *out = NULL;
     PDP_PERF_LOCK(&framework_g_key_pool_lock);
-    framework_KeyEventPayload *p = framework_g_key_pool;
-    if (p) framework_g_key_pool = p->next_free;
+    framework_KeyEventPayload **slot = &framework_g_key_pool;
+    /* Native queues retain a global reference until their delayed read ends. */
+    while (*slot && pdp_jni_global_ref_count_host((*slot)->object_global) > 1u)
+        slot = &(*slot)->next_free;
+    framework_KeyEventPayload *p = *slot;
+    if (p) *slot = p->next_free;
     pthread_mutex_unlock(&framework_g_key_pool_lock);
     void *local = NULL;
     if (p) {
@@ -29807,6 +29813,7 @@ static void *framework_key_event_obtain(void *env, framework_KeyEventPayload **o
             return NULL;
         }
     }
+    p->diagnostic_owner = pthread_self();
     *out = p;
     return local;
 }
@@ -29908,9 +29915,24 @@ enum framework_KeyOp {
     KEY_GET_DEVICE, KEY_GET_DISPLAY_ID, KEY_GET_DOWN_TIME, KEY_GET_EVENT_TIME, KEY_IS_LONG_PRESS,
     KEY_GET_UNICODE_CHAR, KEY_GET_CHARACTER_MAP, KEY_RECYCLE, KEY_TO_STRING,
 };
+static void framework_input_trace_key(framework_KeyEventPayload *p, int op) {
+    if (!pdp_diag_logging_enabled || (op != KEY_GET_ACTION && op != KEY_GET_KEYCODE)) return;
+    const unsigned bit = 1u << op;
+    const unsigned reader = pthread_equal(p->diagnostic_owner, pthread_self()) ? 0u : 1u;
+    if (__atomic_fetch_or(&p->diagnostic_reads[reader], bit, __ATOMIC_RELAXED) & bit) return;
+    static unsigned reports;
+    const unsigned sequence = __atomic_fetch_add(&reports, 1u, __ATOMIC_RELAXED);
+    if (sequence >= 2048u) return;
+    PDP_LOGCI("INPUT", "key-read sequence=%u readNs=%lld thread=%lx event=%p eventNs=%lld op=%d action=%d code=%d source=0x%x globals=%u%s",
+              sequence + 1u, (long long)framework_framework_uptime_nanos(), (unsigned long)pthread_self(),
+              p->object_global, (long long)p->event_time_ns, op, p->action, p->key_code,
+              (unsigned)p->source, pdp_jni_global_ref_count_host(p->object_global),
+              sequence == 2047u ? " budget-exhausted" : "");
+}
 static PdpJniValue framework_key_event_op(void *env, void *token, const PdpJniValue *a, size_t n, void *u) {
     framework_KeyEventPayload *p = framework_key_payload(token);
     if (!p) return framework_v_int(0);
+    framework_input_trace_key(p, (int)(intptr_t)u);
     switch ((enum framework_KeyOp)(intptr_t)u) {
         case KEY_GET_ACTION: return framework_v_int(p->action);
         case KEY_GET_KEYCODE: return framework_v_int(p->key_code);
@@ -30015,7 +30037,15 @@ static void framework_android_dispatch_key_change(void *env, void *activity, uin
     p->event_time_ns = now_ns;
     p->down_time_ns = framework_g_key_down_times[code] ? framework_g_key_down_times[code] : now_ns;
     PdpJniValue arg = {.l = event};
-    (void)framework_touch_call_bool(env, activity, "dispatchKeyEvent", KEY_EVENT_SIG, &arg, 1);
+    const bool handled = framework_touch_call_bool(env, activity, "dispatchKeyEvent", KEY_EVENT_SIG, &arg, 1);
+    static unsigned reports;
+    if (pdp_diag_logging_enabled && reports < 2048u) {
+        ++reports;
+        PDP_LOGCI("INPUT", "key-dispatch sequence=%u thread=%lx event=%p eventNs=%lld action=%d code=%d source=0x%x handled=%d pending=%d globals=%u%s",
+                  reports, (unsigned long)pthread_self(), p->object_global, (long long)now_ns,
+                  action, code, (unsigned)p->source, handled, pdp_jni_exception_pending_host(env),
+                  pdp_jni_global_ref_count_host(p->object_global), reports == 2048u ? " budget-exhausted" : "");
+    }
     framework_key_event_release(p);
     pdp_jni_delete_local_ref_host(env, event);
     if (action == KEY_ACTION_UP) framework_g_key_down_times[code] = 0;
@@ -30056,6 +30086,8 @@ typedef struct framework_MotionPointer {
 
 typedef struct framework_MotionEventPayload {
     uint64_t magic;
+    unsigned diagnostic_reads[2];
+    pthread_t diagnostic_owner;
     void *object_global;
     int32_t action;
     int32_t source;
@@ -30097,8 +30129,11 @@ static framework_MotionEventPayload *framework_motion_payload_ref(void *ref) {
 /* A cleared event from the pool, or a new one. Returns a local reference. */
 static void *framework_motion_event_obtain(void *env, framework_MotionEventPayload **out) {
     PDP_PERF_LOCK(&framework_g_motion_pool_lock);
-    framework_MotionEventPayload *p = framework_g_motion_pool;
-    if (p) framework_g_motion_pool = p->next_free;
+    framework_MotionEventPayload **slot = &framework_g_motion_pool;
+    while (*slot && pdp_jni_global_ref_count_host((*slot)->object_global) > 1u)
+        slot = &(*slot)->next_free;
+    framework_MotionEventPayload *p = *slot;
+    if (p) *slot = p->next_free;
     pthread_mutex_unlock(&framework_g_motion_pool_lock);
     void *local = NULL;
     if (p) {
@@ -30122,6 +30157,7 @@ static void *framework_motion_event_obtain(void *env, framework_MotionEventPaylo
         }
     }
     p->x_precision = p->y_precision = 1.0f;
+    p->diagnostic_owner = pthread_self();
     *out = p;
     return local;
 }
@@ -30143,6 +30179,8 @@ static void *framework_motion_event_copy(void *env, const framework_MotionEventP
     void *global = p->object_global;
     *p = *src;
     p->object_global = global;
+    memset(p->diagnostic_reads, 0, sizeof(p->diagnostic_reads));
+    p->diagnostic_owner = pthread_self();
     p->recycled = false;
     p->next_free = NULL;
     return local;
@@ -30183,6 +30221,21 @@ static float framework_motion_axis(const framework_MotionEventPayload *p, const 
         case 8: return ptr->orientation;
         default: return 0.0f;
     }
+}
+
+static void framework_input_trace_axis(framework_MotionEventPayload *p, int32_t axis, float value) {
+    if (!pdp_diag_logging_enabled || p->source != PDP_SOURCE_JOYSTICK || axis < 0 || axis >= 32) return;
+    const unsigned bit = 1u << (unsigned)axis;
+    const unsigned reader = pthread_equal(p->diagnostic_owner, pthread_self()) ? 0u : 1u;
+    if (__atomic_fetch_or(&p->diagnostic_reads[reader], bit, __ATOMIC_RELAXED) & bit) return;
+    static unsigned reports;
+    const unsigned sequence = __atomic_fetch_add(&reports, 1u, __ATOMIC_RELAXED);
+    if (sequence >= 8192u) return;
+    PDP_LOGCI("INPUT", "axis-read sequence=%u readNs=%lld thread=%lx event=%p eventNs=%lld axis=%d value=%.4f xy=%.4f,%.4f hat=%.1f,%.1f globals=%u%s",
+              sequence + 1u, (long long)framework_framework_uptime_nanos(), (unsigned long)pthread_self(),
+              p->object_global, (long long)p->event_time_ns, axis, value,
+              p->joystick_axes[0], p->joystick_axes[1], p->joystick_axes[15], p->joystick_axes[16],
+              pdp_jni_global_ref_count_host(p->object_global), sequence == 8191u ? " budget-exhausted" : "");
 }
 
 static const framework_MotionPointer *framework_motion_pointer_arg(void *env, const framework_MotionEventPayload *p, int32_t index) {
@@ -30234,10 +30287,13 @@ static PdpJniValue framework_motion_event_op(void *env, void *token, const PdpJn
             if (op == MOTION_GET_RAW_Y) return framework_v_float(value - p->y_offset);
             return framework_v_float(value);
         }
-        case MOTION_GET_AXIS_VALUE:
+        case MOTION_GET_AXIS_VALUE: {
             ptr = n == 1 ? (p->pointer_count ? &p->pointers[0] : NULL)
                          : n == 2 ? framework_motion_pointer_arg(env, p, a[1].i) : NULL;
-            return framework_v_float(ptr ? framework_motion_axis(p, ptr, a[0].i) : 0.0f);
+            const float value = ptr ? framework_motion_axis(p, ptr, a[0].i) : 0.0f;
+            framework_input_trace_axis(p, a[0].i, value);
+            return framework_v_float(value);
+        }
         case MOTION_GET_HISTORY_SIZE: return framework_v_int(0);
         case MOTION_GET_HISTORICAL:
             /* No batched samples: every historyPos is out of range. */
@@ -30624,7 +30680,18 @@ static void framework_android_dispatch_joystick_motion(void *env, void *activity
     p->pointers[0].x = p->joystick_axes[0];
     p->pointers[0].y = p->joystick_axes[1];
     PdpJniValue arg = {.l = event};
-    (void)framework_touch_call_bool(env, activity, "dispatchGenericMotionEvent", MOTION_EVENT_SIG, &arg, 1);
+    const bool handled = framework_touch_call_bool(env, activity, "dispatchGenericMotionEvent", MOTION_EVENT_SIG, &arg, 1);
+    static unsigned input_reports;
+    if (pdp_diag_logging_enabled && input_reports < 4096u) {
+        ++input_reports;
+        PDP_LOGCI("INPUT", "joystick sequence=%u timeNs=%lld thread=%lx rawLeft=%.4f,%.4f rawRight=%.4f,%.4f buttons=0x%llx axesXY=%.4f,%.4f hatXY=%.1f,%.1f handled=%d pending=%d event=%p globals=%u%s",
+                  input_reports, (long long)now_ns, (unsigned long)pthread_self(),
+                  snapshot->left_x, snapshot->left_y, snapshot->right_x, snapshot->right_y,
+                  (unsigned long long)snapshot->buttons, p->joystick_axes[0], p->joystick_axes[1],
+                  p->joystick_axes[15], p->joystick_axes[16], handled,
+                  pdp_jni_exception_pending_host(env), p->object_global,
+                  pdp_jni_global_ref_count_host(p->object_global), input_reports == 4096u ? " budget-exhausted" : "");
+    }
     framework_motion_event_release(p);
     pdp_jni_delete_local_ref_host(env, event);
 }

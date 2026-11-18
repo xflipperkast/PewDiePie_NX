@@ -1,0 +1,352 @@
+diff --git a/src/egl/drivers/switch/egl_switch.c b/src/egl/drivers/switch/egl_switch.c
+index af56ca6..dac17da 100644
+--- a/src/egl/drivers/switch/egl_switch.c
++++ b/src/egl/drivers/switch/egl_switch.c
+@@ -61,6 +61,15 @@
+ 
+ #include "mapi/glapi/glapi.h"
+ 
++/* Offsets in the pinned switch-mesa 20.1.0-5 archive. */
++#ifdef __aarch64__
++_Static_assert(offsetof(_EGLDisplay, DriverData) == 88, "Mesa display ABI changed");
++_Static_assert(sizeof(_EGLConfig) == 160, "Mesa config ABI changed");
++_Static_assert(sizeof(_EGLContext) == 104, "Mesa context ABI changed");
++_Static_assert(sizeof(_EGLSurface) == 200, "Mesa surface ABI changed");
++_Static_assert(offsetof(struct pipe_screen, resource_create) == 128, "Gallium screen ABI changed");
++#endif
++
+ #define NUM_BUFFERS 3
+ 
+ #ifdef DEBUG
+@@ -98,6 +107,7 @@ struct switch_egl_surface
+     struct st_framebuffer_iface *stfbi;
+     struct pipe_resource *attachments[ST_ATTACHMENT_COUNT];
+ 
++    struct pipe_resource *color; /* Owned offscreen or multisample color buffer. */
+     NWindow* nw;
+     s32 cur_slot;
+     struct pipe_resource *buffers[NUM_BUFFERS];
+@@ -110,6 +120,7 @@ struct switch_framebuffer
+    struct switch_egl_display* display;
+    struct switch_egl_surface* surface;
+    struct pipe_resource template;
++   struct st_visual visual;
+ };
+ 
+ static inline struct switch_framebuffer *
+@@ -155,13 +166,17 @@ switch_st_framebuffer_validate(struct st_context_iface *stctx, struct st_framebu
+             {
+                 case ST_ATTACHMENT_BACK_LEFT:
+                 {
+-                    Result rc = nwindowDequeueBuffer(surface->nw, &surface->cur_slot, NULL);
+-                    if (R_FAILED(rc)) fatalThrow(rc);
+-
+-                    // Use the dequeued buffer as the back buffer
+-                    res = surface->buffers[surface->cur_slot];
++                    if (surface->nw && surface->cur_slot < 0) {
++                        Result rc = nwindowDequeueBuffer(surface->nw, &surface->cur_slot, NULL);
++                        if (R_FAILED(rc)) fatalThrow(rc);
++                    }
++                    res = surface->color ? surface->color : surface->buffers[surface->cur_slot];
+                     break;
+                 }
++                case ST_ATTACHMENT_FRONT_LEFT:
++                    if (!surface->nw)
++                        res = surface->color;
++                    break;
+                 case ST_ATTACHMENT_DEPTH_STENCIL:
+                 case ST_ATTACHMENT_ACCUM:
+                 {
+@@ -178,6 +193,11 @@ switch_st_framebuffer_validate(struct st_context_iface *stctx, struct st_framebu
+ 
+                     // Create the requested resource
+                     res = screen->resource_create(screen, &fb->template);
++                    if (!res) {
++                        for (unsigned j = 0; j < i; j++)
++                            pipe_resource_reference(&out[j], NULL);
++                        return false;
++                    }
+                     break;
+                 }
+                 default:
+@@ -227,6 +247,7 @@ switch_egl_surface_cleanup(struct switch_egl_surface *surface)
+     for (i = 0; i < NUM_BUFFERS; i ++)
+         pipe_resource_reference(&surface->buffers[i], NULL);
+ 
++    pipe_resource_reference(&surface->color, NULL);
+     if (surface->stfbi)
+         free(surface->stfbi);
+ 
+@@ -252,6 +273,7 @@ switch_create_window_surface(_EGLDriver *drv, _EGLDisplay *dpy,
+         return NULL;
+     }
+ 
++    surface->cur_slot = -1;
+     if (!_eglInitSurface(&surface->base, dpy, EGL_WINDOW_BIT, conf, attrib_list, native_window))
+         goto cleanup;
+ 
+@@ -262,14 +284,15 @@ switch_create_window_surface(_EGLDriver *drv, _EGLDisplay *dpy,
+         goto cleanup;
+     }
+ 
++    surface->stfbi = &fb->base;
+     // Use the specified native window, and check its validity
+-    surface->nw = (NWindow*)native_window;
+-    if (!nwindowIsValid(surface->nw))
++    if (!nwindowIsValid((NWindow*)native_window))
+     {
+         _eglError(EGL_BAD_NATIVE_WINDOW, "switch_create_window_surface: not a valid native window reference");
+         goto cleanup;
+     }
+ 
++    surface->nw = (NWindow*)native_window;
+     // Allocate framebuffers and attach them to the native window
+     nwindowGetDimensions(surface->nw, &width, &height);
+     fb->display = display;
+@@ -307,8 +330,15 @@ switch_create_window_surface(_EGLDriver *drv, _EGLDisplay *dpy,
+         if (R_FAILED(rc)) fatalThrow(rc);
+     }
+ 
+-    surface->stfbi = &fb->base;
+-    surface->cur_slot = -1;
++    fb->template.nr_samples = fb->template.nr_storage_samples = config->stvis.samples;
++    if (config->stvis.samples) {
++        fb->template.bind |= PIPE_BIND_SAMPLER_VIEW;
++        surface->color = display->stmgr->screen->resource_create(display->stmgr->screen, &fb->template);
++        if (!surface->color) {
++            _eglError(EGL_BAD_ALLOC, "switch_create_window_surface: multisample allocation failed");
++            goto cleanup;
++        }
++    }
+ 
+     // Setup the st_framebuffer_iface
+     fb->base.visual = &config->stvis;
+@@ -340,7 +370,57 @@ static _EGLSurface *
+ switch_create_pbuffer_surface(_EGLDriver *drv, _EGLDisplay *disp,
+     _EGLConfig *conf, const EGLint *attrib_list)
+ {
+-    CALLED();
++    struct switch_egl_display *display = switch_egl_display(disp);
++    struct switch_egl_config *config = switch_egl_config(conf);
++    struct switch_egl_surface *surface = calloc(1, sizeof(*surface));
++    struct switch_framebuffer *fb;
++    if (!surface)
++        goto allocation_failed;
++    surface->cur_slot = -1;
++    if (!_eglInitSurface(&surface->base, disp, EGL_PBUFFER_BIT, conf, attrib_list, NULL))
++        goto cleanup;
++    fb = calloc(1, sizeof(*fb));
++    if (!fb)
++        goto allocation_failed;
++    surface->stfbi = &fb->base;
++    if (surface->base.Width > conf->MaxPbufferWidth || surface->base.Height > conf->MaxPbufferHeight) {
++        if (!surface->base.LargestPbuffer) {
++            _eglError(EGL_BAD_ALLOC, "switch_create_pbuffer_surface: size exceeds config limits");
++            goto cleanup;
++        }
++        surface->base.Width = MIN2(surface->base.Width, conf->MaxPbufferWidth);
++        surface->base.Height = MIN2(surface->base.Height, conf->MaxPbufferHeight);
++    }
++    fb->display = display;
++    fb->surface = surface;
++    fb->template.target = PIPE_TEXTURE_RECT;
++    fb->template.format = config->stvis.color_format;
++    fb->template.width0 = MAX2(surface->base.Width, 1);
++    fb->template.height0 = MAX2(surface->base.Height, 1);
++    fb->template.depth0 = fb->template.array_size = 1;
++    fb->template.usage = PIPE_USAGE_DEFAULT;
++    fb->template.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
++    fb->template.nr_samples = fb->template.nr_storage_samples = config->stvis.samples;
++    surface->color = display->stmgr->screen->resource_create(display->stmgr->screen, &fb->template);
++    if (!surface->color)
++        goto allocation_failed;
++    fb->visual = config->stvis;
++    fb->visual.buffer_mask = ST_ATTACHMENT_FRONT_LEFT_MASK;
++    fb->visual.render_buffer = ST_ATTACHMENT_FRONT_LEFT_MASK;
++    fb->base.visual = &fb->visual;
++    fb->base.flush_front = switch_st_framebuffer_flush_front;
++    fb->base.validate = switch_st_framebuffer_validate;
++    fb->base.flush_swapbuffers = switch_st_framebuffer_flush_swapbuffers;
++    p_atomic_set(&fb->base.stamp, 0);
++    fb->base.ID = p_atomic_inc_return(&drifb_ID);
++    fb->base.state_manager = display->stmgr;
++    return &surface->base;
++
++allocation_failed:
++    _eglError(EGL_BAD_ALLOC, "switch_create_pbuffer_surface: allocation failed");
++cleanup:
++    if (surface)
++        switch_egl_surface_cleanup(surface);
+     return NULL;
+ }
+ 
+@@ -359,7 +439,7 @@ switch_destroy_surface(_EGLDriver *drv, _EGLDisplay *disp, _EGLSurface *surf)
+ 
+ 
+ static EGLBoolean
+-switch_add_config(_EGLDisplay *dpy, EGLint *id, enum pipe_format colorfmt, enum pipe_format depthfmt)
++switch_add_config(_EGLDisplay *dpy, EGLint *id, enum pipe_format colorfmt, enum pipe_format depthfmt, unsigned samples)
+ {
+     CALLED();
+ 
+@@ -373,7 +453,12 @@ switch_add_config(_EGLDisplay *dpy, EGLint *id, enum pipe_format colorfmt, enum
+ 
+     // General configuration
+     conf->base.NativeRenderable = EGL_TRUE;
+-    conf->base.SurfaceType = EGL_WINDOW_BIT; // we only support creating window surfaces
++    conf->base.SurfaceType = EGL_WINDOW_BIT | EGL_PBUFFER_BIT;
++    conf->base.MaxPbufferWidth = _EGL_MAX_PBUFFER_WIDTH;
++    conf->base.MaxPbufferHeight = _EGL_MAX_PBUFFER_HEIGHT;
++    conf->base.MaxPbufferPixels = _EGL_MAX_PBUFFER_WIDTH * _EGL_MAX_PBUFFER_HEIGHT;
++    conf->base.SampleBuffers = samples ? 1 : 0;
++    conf->base.Samples = samples;
+     conf->base.RenderableType = EGL_OPENGL_BIT | EGL_OPENGL_ES_BIT | EGL_OPENGL_ES2_BIT | EGL_OPENGL_ES3_BIT_KHR;
+     conf->base.Conformant = conf->base.RenderableType;
+     conf->base.MinSwapInterval = 0;
+@@ -393,6 +478,7 @@ switch_add_config(_EGLDisplay *dpy, EGLint *id, enum pipe_format colorfmt, enum
+     }
+ 
+     // Visual
++    conf->stvis.samples = samples;
+     conf->stvis.buffer_mask = ST_ATTACHMENT_FRONT_LEFT_MASK | ST_ATTACHMENT_BACK_LEFT_MASK;
+     conf->stvis.color_format = colorfmt;
+     conf->stvis.depth_stencil_format = depthfmt;
+@@ -435,15 +521,25 @@ switch_add_configs_for_visuals(_EGLDisplay *dpy)
+ 
+     // Add all combinations of color/depth buffer formats
+     EGLint config_id = 0;
+-    EGLint i, j;
+-    for (i = 0; i < sizeof(colorfmts)/sizeof(colorfmts[0]); i ++) {
+-        for (j = 0; j < sizeof(depthfmts)/sizeof(depthfmts[0]); j ++) {
+-            EGLBoolean rc = switch_add_config(dpy, &config_id, colorfmts[i], depthfmts[j]);
+-            if (!rc)
+-                return rc;
++    struct pipe_screen *screen = switch_egl_display(dpy)->stmgr->screen;
++    static const unsigned sample_counts[] = { 0, 2, 4, 8, 16, 32 };
++    EGLint i, j, k;
++    for (k = 0; k < ARRAY_SIZE(sample_counts); k ++) {
++        unsigned samples = sample_counts[k];
++        for (i = 0; i < ARRAY_SIZE(colorfmts); i ++) {
++            for (j = 0; j < ARRAY_SIZE(depthfmts); j ++) {
++                if (!screen->is_format_supported(screen, colorfmts[i], PIPE_TEXTURE_RECT,
++                                                 samples, samples, PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW) ||
++                    (depthfmts[j] != PIPE_FORMAT_NONE &&
++                     !screen->is_format_supported(screen, depthfmts[j], PIPE_TEXTURE_RECT,
++                                                  samples, samples, PIPE_BIND_DEPTH_STENCIL)))
++                    continue;
++                EGLBoolean rc = switch_add_config(dpy, &config_id, colorfmts[i], depthfmts[j], samples);
++                if (!rc)
++                    return rc;
++            }
+         }
+     }
+-
+     return EGL_TRUE;
+ }
+ 
+@@ -463,9 +559,6 @@ switch_initialize(_EGLDriver *drv, _EGLDisplay *dpy)
+     struct pipe_screen *screen;
+     CALLED();
+ 
+-    if (!switch_add_configs_for_visuals(dpy))
+-        return EGL_FALSE;
+-
+     display = (struct switch_egl_display*) calloc(1, sizeof (*display));
+     if (!display) {
+         _eglError(EGL_BAD_ALLOC, "switch_initialize");
+@@ -506,6 +599,15 @@ switch_initialize(_EGLDriver *drv, _EGLDisplay *dpy)
+ 
+     display->stmgr = stmgr;
+     display->stapi = st_gl_api_create();
++    if (!switch_add_configs_for_visuals(dpy)) {
++        _eglCleanupDisplay(dpy);
++        display->stapi->destroy(display->stapi);
++        stmgr->screen->destroy(stmgr->screen);
++        free(stmgr);
++        free(display);
++        dpy->DriverData = NULL;
++        return EGL_FALSE;
++    }
+     return EGL_TRUE;
+ }
+ 
+@@ -601,7 +703,7 @@ switch_create_context(_EGLDriver *drv, _EGLDisplay *dpy, _EGLConfig *conf,
+     }
+ 
+     enum st_context_error error;
+-    context->stctx = display->stapi->create_context(display->stapi, display->stmgr, &attribs, &error, NULL);
++    context->stctx = display->stapi->create_context(display->stapi, display->stmgr, &attribs, &error, share_list ? switch_egl_context(share_list)->stctx : NULL);
+     if (error != ST_CONTEXT_SUCCESS) {
+         _eglError(EGL_BAD_MATCH, "switch_create_context");
+         goto cleanup;
+@@ -670,11 +772,36 @@ switch_swap_interval(_EGLDriver *drv, _EGLDisplay *dpy, _EGLSurface *surf, EGLin
+     CALLED();
+     struct switch_egl_surface* surface = switch_egl_surface(surf);
+ 
+-    nwindowSetSwapInterval(surface->nw, interval);
++    if (surface->nw)
++        nwindowSetSwapInterval(surface->nw, interval);
+     return EGL_TRUE;
+ }
+ 
+ 
++/* Run after queued GL vertices reach Gallium, before submitting the frame fence. */
++struct switch_resolve {
++    struct pipe_context *pipe;
++    struct switch_egl_surface *surface;
++};
++
++static void
++switch_resolve_before_flush(void *data)
++{
++    struct switch_resolve *resolve = data;
++    struct switch_egl_surface *surface = resolve->surface;
++    struct pipe_blit_info blit = {0};
++    blit.src.resource = surface->color;
++    blit.dst.resource = surface->buffers[surface->cur_slot];
++    blit.src.format = blit.src.resource->format;
++    blit.dst.format = blit.dst.resource->format;
++    blit.src.box.width = blit.dst.box.width = blit.dst.resource->width0;
++    blit.src.box.height = blit.dst.box.height = blit.dst.resource->height0;
++    blit.src.box.depth = blit.dst.box.depth = 1;
++    blit.mask = PIPE_MASK_RGBA;
++    blit.filter = PIPE_TEX_FILTER_NEAREST;
++    resolve->pipe->blit(resolve->pipe, &blit);
++}
++
+ static EGLBoolean
+ switch_swap_buffers(_EGLDriver *drv, _EGLDisplay *dpy, _EGLSurface *surf)
+ {
+@@ -688,11 +815,13 @@ switch_swap_buffers(_EGLDriver *drv, _EGLDisplay *dpy, _EGLSurface *surf)
+     }
+ 
+     TRACE("Flushing context\n");
+-    context->stctx->flush(context->stctx, ST_FLUSH_END_OF_FRAME, NULL, NULL, NULL);
++    struct switch_resolve resolve = { context->stctx->pipe, surface };
++    context->stctx->flush(context->stctx, ST_FLUSH_END_OF_FRAME, NULL,
++                         surface->color ? switch_resolve_before_flush : NULL, &resolve);
+ 
+     NvMultiFence mf = {0};
+     NvFence fence;
+-    struct pipe_resource *old_back = surface->attachments[ST_ATTACHMENT_BACK_LEFT];
++    struct pipe_resource *old_back = surface->buffers[surface->cur_slot];
+     fence.id = nouveau_switch_resource_get_syncpoint(old_back, &fence.value);
+     if ((int)fence.id >= 0) {
+         NvFence* surf_fence = &surface->fences[surface->cur_slot];
+diff --git a/src/egl/main/egldisplay.h b/src/egl/main/egldisplay.h
+index 2d8cff7..ffe486b 100644
+--- a/src/egl/main/egldisplay.h
++++ b/src/egl/main/egldisplay.h
+@@ -156,7 +156,12 @@ struct _egl_display
+    /* used to link displays */
+    _EGLDisplay *Next;
+ 
++#ifdef PDP_MESA_PINNED_DISPLAY_ABI
++   /* Owned by the pinned archive; this driver never operates its mutex. */
++   uint32_t Mutex[4];
++#else
+    mtx_t Mutex;
++#endif
+ 
+    _EGLPlatformType Platform; /**< The type of the platform display */
+    void *PlatformDisplay;     /**< A pointer to the platform display */

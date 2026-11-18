@@ -3882,11 +3882,21 @@ int main(int argc, char **argv) {
         main_show_startup_failure();
         return 1;
     }
-    pdp_diag_init(NX_LOG);
     pdp_diag_set_stdout(false);
+    FILE *log_flag = fopen(NX_LOG_FLAG, "rb");
+    if (log_flag) {
+        fclose(log_flag);
+        if (!pdp_diag_init(NX_LOG)) {
+            main_failure_checkpoint("Could not open graphics.log (errno=%d).", errno);
+            nx_storage_shutdown();
+            main_show_startup_failure();
+            return 1;
+        }
+        pdp_diag_logging_enabled = true;
+    }
     pdp_diag_set_full_trace(false);
     pdp_dex_set_strict_linkage(false);
-    PDP_LOGI("pewdiepie_nx 1.0.1 starting; input=cursor-4 package=%s", NX_PACKAGE);
+    PDP_LOGI("pewdiepie_nx 1.0.1 build=%s %s starting; input=axis-read-1 perf=jni-ref-reuse-1 package=%s", __DATE__, __TIME__, NX_PACKAGE);
     Result romfs_rc = romfsInit();
     if (R_FAILED(romfs_rc)) {
         PDP_LOGCE("BOOT", "RomFS mount failed rc=0x%08x", romfs_rc);
